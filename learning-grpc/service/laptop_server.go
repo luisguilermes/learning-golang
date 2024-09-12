@@ -14,6 +14,7 @@ import (
 // LaptopServiceServer is the server that provides laptop services
 type LaptopServer struct {
 	Store LaptopStore
+	pb.UnimplementedLaptopServiceServer
 }
 
 // NewLaptopServiceServer returns a new LaptopServiceServer
@@ -52,6 +53,18 @@ func (server *LaptopServer) CreateLaptop(
 		laptop.Id = id.String()
 	}
 
+	// some heavy processing
+	// time.Sleep(6 * time.Second)
+	// if ctx.Err() == context.Canceled {
+	// 	log.Print("The client has cancelled the request")
+	// 	return nil, status.Error(codes.Canceled, "the client has cancelled the request")
+	// }
+
+	// if ctx.Err() == context.DeadlineExceeded {
+	// 	log.Print("deadline is exceeded")
+	// 	return nil, status.Error(codes.DeadlineExceeded, "deadline is exceeded")
+	// }
+
 	//save the laptop to the in-memory store
 	err := server.Store.Save(laptop)
 	if err != nil {
@@ -67,4 +80,34 @@ func (server *LaptopServer) CreateLaptop(
 		Id: laptop.GetId(),
 	}
 	return res, nil
+}
+
+func (server *LaptopServer) SearchLaptop(
+	req *pb.SearchLaptopRequest,
+	stream pb.LaptopService_SearchLaptopServer,
+) error {
+	filter := req.GetFilter()
+	log.Printf("Receive a search-laptop request with filter: %v", filter)
+
+	err := server.Store.Search(
+		stream.Context(),
+		filter,
+		func(laptop *pb.Laptop) error {
+			res := &pb.SearchLaptopResponse{Laptop: laptop}
+
+			err := stream.Send(res)
+			if err != nil {
+				return err
+			}
+
+			log.Printf("Sent laptop with ID: %s", laptop.GetId())
+			return nil
+		},
+	)
+
+	if err != nil {
+		return status.Errorf(codes.Internal, "unexpected error: %v", err)
+	}
+
+	return nil
 }
