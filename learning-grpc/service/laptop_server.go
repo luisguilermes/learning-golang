@@ -1,9 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/luisguilermes/learning-golang/learning-grpc/pb"
@@ -11,16 +14,22 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const maxImageSize = 1 << 20 // 1 MB
+
 // LaptopServiceServer is the server that provides laptop services
 type LaptopServer struct {
-	Store LaptopStore
+	laptopStore LaptopStore
+	imageStore  ImageStore
+	ratingStore RatingStore
 	pb.UnimplementedLaptopServiceServer
 }
 
 // NewLaptopServiceServer returns a new LaptopServiceServer
-func NewLaptopServer(store LaptopStore) *LaptopServer {
+func NewLaptopServer(laptopStore LaptopStore, imageStore ImageStore, ratingStore RatingStore) *LaptopServer {
 	return &LaptopServer{
-		Store: store,
+		laptopStore: laptopStore,
+		imageStore:  imageStore,
+		ratingStore: ratingStore,
 	}
 }
 
@@ -66,7 +75,7 @@ func (server *LaptopServer) CreateLaptop(
 	// }
 
 	//save the laptop to the in-memory store
-	err := server.Store.Save(laptop)
+	err := server.laptopStore.Save(laptop)
 	if err != nil {
 		code := codes.Internal
 		if errors.Is(err, ErrAlreadyExists) {
@@ -89,7 +98,7 @@ func (server *LaptopServer) SearchLaptop(
 	filter := req.GetFilter()
 	log.Printf("Receive a search-laptop request with filter: %v", filter)
 
-	err := server.Store.Search(
+	err := server.laptopStore.Search(
 		stream.Context(),
 		filter,
 		func(laptop *pb.Laptop) error {
@@ -110,4 +119,140 @@ func (server *LaptopServer) SearchLaptop(
 	}
 
 	return nil
+}
+
+func (server *LaptopServer) UploadImage(
+	stream pb.LaptopService_UploadImageServer,
+) error {
+	req, err := stream.Recv()
+	if err != nil {
+		log.Printf("cannot receive image info: %v", err)
+		return logError(status.Errorf(codes.Unknown, "cannot receive image info: %v", err))
+	}
+
+	laptopID := req.GetInfo().GetLaptopId()
+	imageType := req.GetInfo().GetImageType()
+	log.Printf("Receive an upload-image request for laptop %s with image type %s", laptopID, imageType)
+
+	laptop, err := server.laptopStore.Find(laptopID)
+	if err != nil {
+		return logError(status.Errorf(codes.Internal, "cannot find laptop: %v", err))
+	}
+	if laptop == nil {
+		return logError(status.Errorf(codes.InvalidArgument, "laptop %s doesn't exist", laptopID))
+	}
+
+	imageData := bytes.Buffer{}
+	imageSize := 0
+	for {
+		log.Printf("waiting to receive more data")
+		req, err := stream.Recv()
+		if err == io.EOF {
+			log.Print("no more data")
+			break
+		}
+		if err != nil {
+			return logError(status.Errorf(codes.Unknown, "cannot receive chunk data: %v", err))
+		}
+		chunk := req.GetChunkData()
+		size := len(chunk)
+
+		log.Printf("receive a chunk with size: %d", size)
+
+		imageSize += size
+		if imageSize > maxImageSize {
+			return logError(status.Error(codes.InvalidArgument, "image is too large"))
+		}
+
+		// write slowly
+		time.Sleep(time.Second)
+
+		_, err = imageData.Write(chunk)
+		if err != nil {
+			return logError(status.Errorf(codes.Internal, "cannot write chunk data: %v", err))
+		}
+	}
+
+	imageID, err := server.imageStore.Save(laptopID, imageType, imageData)
+	if err != nil {
+		return logError(status.Errorf(codes.Internal, "cannot save image to the store: %v", err))
+	}
+	res := &pb.UploadImageResponse{
+		Id:   imageID,
+		Size: uint32(imageSize),
+	}
+
+	err = stream.SendAndClose(res)
+	if err != nil {
+		return logError(status.Errorf(codes.Unknown, "cannot send response: %v", err))
+	}
+	log.Printf("Image with ID %s and size %d saved to the store", imageID, imageSize)
+	return nil
+}
+
+func (server *LaptopServer) RateLaptop(
+	stream pb.LaptopService_RateLaptopServer,
+) error {
+	for {
+		err := contextError(stream.Context())
+		if err != nil {
+			return err
+		}
+
+		req, err := stream.Recv()
+		if err == io.EOF {
+			log.Print("no more rating")
+			break
+		}
+		if err != nil {
+			return logError(status.Errorf(codes.Unknown, "cannot receive rating: %v", err))
+		}
+
+		laptopID := req.GetLaptopId()
+		score := req.GetScore()
+
+		log.Printf("received a rate-laptop request for laptop %s with score %.2f", laptopID, score)
+
+		found, err := server.laptopStore.Find(laptopID)
+		if err != nil {
+			return logError(status.Errorf(codes.Internal, "cannot find laptop: %v", err))
+		}
+		if found == nil {
+			return logError(status.Errorf(codes.NotFound, "laptop %s doesn't exist", laptopID))
+		}
+
+		rating, err := server.ratingStore.Add(laptopID, score)
+		if err != nil {
+			return logError(status.Errorf(codes.Internal, "cannot add rating to the store: %v", err))
+		}
+		res := &pb.RateLaptopResponse{
+			LaptopId:     laptopID,
+			RatedCount:   rating.Count,
+			AverageScore: rating.Sum / float64(rating.Count),
+		}
+		err = stream.Send(res)
+		if err != nil {
+			return logError(status.Errorf(codes.Unknown, "cannot send rating response: %v", err))
+		}
+
+	}
+	return nil
+}
+
+func contextError(ctx context.Context) error {
+	switch ctx.Err() {
+	case context.Canceled:
+		return logError(status.Error(codes.Canceled, "client cancelled the request"))
+	case context.DeadlineExceeded:
+		return logError(status.Error(codes.DeadlineExceeded, "deadline exceeded"))
+	default:
+		return nil
+	}
+}
+
+func logError(err error) error {
+	if err != nil {
+		log.Print(err)
+	}
+	return err
 }
